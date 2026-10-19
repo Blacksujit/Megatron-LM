@@ -20,6 +20,14 @@ class DistributedSetup:
     device: torch.device
 
 
+def _release_symmetric_memory_pools() -> None:
+    """Drop the cached symmetric-memory pools so the next test starts from an empty pool."""
+    pools = getattr(symm_mem, "_symm_mem_pools", None)
+    if pools:
+        # Drops the pools' last references, freeing their segments and rendezvous state.
+        pools.clear()
+
+
 @pytest.fixture(scope="function")
 def distributed_setup() -> Iterator[DistributedSetup]:
     """Set up this rank's local device and clean up per-test process groups."""
@@ -53,6 +61,9 @@ def distributed_setup() -> Iterator[DistributedSetup]:
         if device.type == "cuda":
             # Pass the device explicitly to suppress PyTorch's NCCL barrier warning.
             dist.barrier(device_ids=[device.index])
+            # Release while the test's communicators still exist, so NCCL can
+            # deregister the pools' windows before their groups are destroyed.
+            _release_symmetric_memory_pools()
         else:
             dist.barrier()
 
