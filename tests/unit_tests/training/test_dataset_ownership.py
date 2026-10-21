@@ -36,7 +36,8 @@ from megatron.training.config import (
     InferenceSetupConfig,
     PretrainConfigContainer,
 )
-from megatron.training.config.dataset_config import MIRROR_FIELDS
+from megatron.training.config import container as container_module
+from megatron.training.config.dataset_config import LAYOUT_MIRRORS, MIRROR_FIELDS
 from megatron.training.datasets.fim_dataset import GPTFIMDataset
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset
@@ -444,12 +445,20 @@ def test_container_writes_the_mirrors_at_finalize(container_factory, monkeypatch
         sequence_parallel=True,
         hybrid_context_parallel=True,
     )
-    monkeypatch.setenv("WORLD_SIZE", "8")
+    monkeypatch.setattr(container_module, "_current_world_size", lambda: 8)
     # The owners stay editable after construction: no stale copy on the dataset config.
     cfg.rng.seed = 42
     cfg.validation.multiple_validation_sets = True
     cfg.validate()
     assert dataset.random_seed is None  # validation writes nothing
+    # data_parallel_size needs the world size: an explicit wrong value passes validate() and is
+    # rejected by finalize() before anything is written.
+    dataset.data_parallel_size = 99
+    with pytest.raises(ValueError, match="data.dataset.data_parallel_size=99 disagrees"):
+        cfg.finalize()
+    assert dataset.data_parallel_size == 99 and dataset.random_seed is None
+    assert not cfg._finalized
+    dataset.data_parallel_size = 2  # an agreeing explicit value is accepted
     cfg.finalize()
     assert dataset.random_seed == 42
     assert dataset.full_validation is True and dataset.multiple_validation_sets is True
@@ -470,26 +479,56 @@ def test_hybrid_flex_policy_writes_only_the_seed(container_factory, monkeypatch)
     cfg.model = _layout(
         tensor_model_parallel_size=2, context_parallel_size=2, hybrid_context_parallel=True
     )
-    monkeypatch.setenv("WORLD_SIZE", "8")
+    monkeypatch.setattr(container_module, "_current_world_size", lambda: 8)
     cfg.finalize()
     dataset = cfg.data.dataset
     assert dataset.random_seed == cfg.rng.seed
     assert all(getattr(dataset, name) is None for name in MIRROR_FIELDS if name != "random_seed")
-    # An explicit layout value is not checked against the model for a policy that never forwarded it.
+    # A policy that never forwarded a mirror keeps Core's default, and the mirrors are not saved
+    # with the section: an explicit value would be lost on reload, so it is rejected.
     dataset.context_parallel_size = 7
+    with pytest.raises(
+        ValueError, match="context_parallel_size=7 is not written by this container"
+    ):
+        cfg.validate()
+    dataset.context_parallel_size = None
+    dataset.data_parallel_size = 1  # Core's default, what prepare() substitutes: not explicit
     cfg.validate()
+
+
+def test_hybrid_flex_layout_survives_a_reload(container_factory, monkeypatch, tokenizer):
+    """What a hybrid-flex run saves reproduces its layout mirrors: Megatron Core's defaults."""
+    _, cfg = container_factory(["--seq-length", "64", "--mock-data"], policy="hybrid_flex")
+    cfg.model = None
+    monkeypatch.setattr(container_module, "_current_world_size", lambda: 8)
+    cfg.finalize()
+    cfg.data.dataset.prepare(tokenizer)
+    layout = tuple(getattr(cfg.data.dataset, name) for name in LAYOUT_MIRRORS)
+    assert layout == (1, None, 0, False)
+    cfg.validate()  # the prepared defaults are not explicit values
+    reloaded = PretrainConfigContainer.from_dict(cfg.to_dict())
+    reloaded.finalize()
+    reloaded.data.dataset.prepare(tokenizer)
+    assert tuple(getattr(reloaded.data.dataset, name) for name in LAYOUT_MIRRORS) == layout
 
 
 def test_mirrors_without_a_model_section(container_factory, monkeypatch, tokenizer):
     _, cfg = container_factory(["--seq-length", "64", "--mock-data"], policy="gpt")
     cfg.model = None
-    monkeypatch.setenv("WORLD_SIZE", "8")
-    cfg.finalize()
+    monkeypatch.setattr(container_module, "_current_world_size", lambda: 8)
     dataset = cfg.data.dataset
+    # Without a model config the layout mirrors have no owner: an explicit value is rejected (it
+    # would not be saved with the section), Core's defaults apply at prepare().
+    dataset.data_parallel_size = 4
+    with pytest.raises(ValueError, match="data_parallel_size=4 is not written .*no model config"):
+        cfg.validate()
+    dataset.data_parallel_size = None
+    cfg.finalize()
     assert dataset.random_seed == cfg.rng.seed and dataset.full_validation is False
     assert dataset.context_parallel_size is None and dataset.data_parallel_size is None
     dataset.prepare(tokenizer)  # Core defaults apply to the layout
     assert (dataset.data_parallel_size, dataset.sequence_parallel_size) == (1, 0)
+    cfg.validate()  # the prepared defaults are not explicit values
 
 
 @pytest.mark.parametrize(
@@ -578,7 +617,7 @@ def test_full_container_round_trips_before_and_after_prepare(
     assert from_file.data.dataset.to_cfg_dict() == cfg.data.dataset.to_cfg_dict()
     # After finalize() and prepare() the file still carries no runtime state.
     cfg.model = None
-    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setattr(container_module, "_current_world_size", lambda: 2)
     cfg.finalize()
     cfg.data.dataset.prepare(tokenizer)
     assert cfg.data.dataset.is_prepared
@@ -631,14 +670,20 @@ def test_runtime_services_prepare_a_finalized_dataset_config(
 ):
     _, cfg = container_factory(["--seq-length", "64", "--mock-data"], policy="gpt")
     cfg.model = None
-    monkeypatch.setenv("WORLD_SIZE", "1")
+    monkeypatch.setattr(container_module, "_current_world_size", lambda: 1)
     monkeypatch.setattr(global_vars, "_GLOBAL_TOKENIZER", tokenizer)
-    global_vars._prepare_dataset_config(cfg)
-    assert not cfg.data.dataset.is_prepared  # not finalized yet: the mirrors are not written
+    with pytest.raises(RuntimeError, match="before the container is finalized"):
+        global_vars._prepare_dataset_config(cfg)  # the mirrors are not written yet
+    assert not cfg.data.dataset.is_prepared
     cfg.finalize()
     global_vars._prepare_dataset_config(cfg)
     assert cfg.data.dataset.is_prepared and cfg.data.dataset.tokenizer is tokenizer
-    global_vars._prepare_dataset_config(cfg)  # idempotent
+    global_vars._prepare_dataset_config(cfg)  # idempotent for the run's tokenizer
+    # A config prepared with another tokenizer is not silently kept: prepare() decides.
+    monkeypatch.setattr(global_vars, "_GLOBAL_TOKENIZER", SimpleNamespace(vocab_size=2048))
+    with pytest.raises(RuntimeError, match="another tokenizer"):
+        global_vars._prepare_dataset_config(cfg)
+    assert cfg.data.dataset.tokenizer is tokenizer
     monkeypatch.setattr(global_vars, "_GLOBAL_TOKENIZER", None)
     _, loader_only = container_factory(["--seq-length", "64"])
     loader_only.finalize()
@@ -650,6 +695,38 @@ def test_runtime_services_prepare_a_finalized_dataset_config(
     assert not unbound.data.dataset.is_prepared
     with pytest.raises(RuntimeError, match="not prepared"):
         unbound.data.dataset_build()
+
+
+def test_set_global_variables_finalizes_a_dataset_section(
+    container_factory, monkeypatch, tokenizer
+):
+    """The compatibility bootstrap: a container with a dataset section is finalized before the
+    runtime services bind the tokenizer; a loader-only container is validated only, as before."""
+    globals_ = ("_GLOBAL_ARGS", "_GLOBAL_RUN_CONFIG", "_GLOBAL_TOKENIZER", "_GLOBAL_TRAIN_STATE")
+    for name in globals_:
+        monkeypatch.setattr(global_vars, name, None)
+    monkeypatch.setattr(container_module, "_current_world_size", lambda: 1)
+
+    def build(_args):
+        global_vars._GLOBAL_TOKENIZER = tokenizer
+        return tokenizer
+
+    monkeypatch.setattr(global_vars, "_build_tokenizer", build)
+    monkeypatch.setattr(global_vars, "_set_wandb_writer", lambda args: None)
+    monkeypatch.setattr(global_vars, "_set_telemetry", lambda args, **kwargs: None)
+    monkeypatch.setattr(global_vars, "initialize_training_runtime_services", lambda args: None)
+    args, cfg = container_factory(["--seq-length", "64", "--mock-data"], policy="gpt")
+    cfg.model = None
+    global_vars.set_global_variables(args, cfg)
+    assert global_vars.get_run_config() is cfg and cfg._finalized
+    assert cfg.data.dataset.is_prepared and cfg.data.dataset.tokenizer is tokenizer
+    dataset_type, config, _ = cfg.data.dataset_build()
+    assert dataset_type is MockGPTDataset and config is cfg.data.dataset
+    for name in globals_:
+        monkeypatch.setattr(global_vars, name, None)
+    args, loader_only = container_factory(["--seq-length", "64"])
+    global_vars.set_global_variables(args, loader_only, build_tokenizer=False)
+    assert global_vars.get_run_config() is loader_only and not loader_only._finalized
 
 
 # The data builders hand the data section to providers that declare it (and only to those).
