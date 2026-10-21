@@ -518,7 +518,8 @@ class DataConfig:
     """The entry point's data policy this section was built with (``gpt``, ``hybrid``,
     ``hybrid_flex``, ``cache``); ``None`` means ``gpt`` for a dataset section."""
 
-    def _policy(self) -> DatasetPolicy:
+    def dataset_policy(self) -> DatasetPolicy:
+        """The ``DatasetPolicy`` this section follows (``gpt`` when unset)."""
         name = self.policy or "gpt"
         if name not in DATA_POLICIES:
             raise ValueError(f"policy must be one of {sorted(DATA_POLICIES)}, got {self.policy!r}.")
@@ -527,7 +528,7 @@ class DataConfig:
     def validate(self) -> None:
         """Check the loader settings, the dataset config and the class / config agreement; no
         mutation."""
-        policy = self._policy()
+        policy = self.dataset_policy()
         self.dataloader.validate()
         if self.dataset is not None:
             self.dataset.validate()
@@ -537,7 +538,9 @@ class DataConfig:
         """Apply the loader defaults and commit the resolved dataset class (idempotent)."""
         self.dataloader.finalize()
         if self.dataset is not None:
-            self.dataset_type = resolve_dataset_class(self.dataset, self.dataset_type, self._policy())
+            self.dataset_type = resolve_dataset_class(
+                self.dataset, self.dataset_type, self.dataset_policy()
+            )
 
     def dataset_build(self) -> tuple[type, GPTDatasetConfig, bool]:
         """``(dataset class, prepared dataset config, is_packed_sequence)`` for the builder."""
